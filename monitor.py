@@ -4,6 +4,7 @@ Phase 1 MVP — lemonade stand edition.
 
 Polls CoinGecko (primary) + DeFiLlama (failover) every 60s.
 Sends Telegram alerts on peg deviations.
+Handles /start, /status, /help bot commands.
 Logs every depeg event to SQLite.
 $0 stack — no paid APIs required.
 """
@@ -12,39 +13,34 @@ import os
 import time
 import sqlite3
 import logging
+import threading
 import requests
 from datetime import datetime, timezone
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL", "")  # e.g. @depegalerts or chat_id
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))  # seconds
-DB_PATH = os.environ.get("DB_PATH", "depeg_events.db")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL", "")  # e.g. @stablewatchalerts
+POLL_INTERVAL    = int(os.environ.get("POLL_INTERVAL", "60"))
+DB_PATH          = os.environ.get("DB_PATH", "depeg_events.db")
 
-# Deviation thresholds (absolute % from $1.00 peg)
 THRESHOLDS = {
-    "warning":  0.0010,   # 0.10%
-    "alert":    0.0050,   # 0.50%
-    "critical": 0.0100,   # 1.00%
+    "warning":  0.0010,
+    "alert":    0.0050,
+    "critical": 0.0100,
 }
 
-# Stablecoins to monitor — Phase 1: 10 majors
 STABLECOINS = [
-    {"id": "tether",          "symbol": "USDT", "name": "Tether"},
-    {"id": "usd-coin",        "symbol": "USDC", "name": "USD Coin"},
-    {"id": "dai",             "symbol": "DAI",  "name": "Dai"},
-    {"id": "frax",            "symbol": "FRAX", "name": "Frax"},
-    {"id": "true-usd",        "symbol": "TUSD", "name": "TrueUSD"},
-    {"id": "paypal-usd",      "symbol": "PYUSD","name": "PayPal USD"},
-    {"id": "liquity-usd",     "symbol": "LUSD", "name": "Liquity USD"},
-    {"id": "curve-dao-token", "symbol": "CRV",  "name": "Curve (skip — not stablecoin, placeholder)"},
-    {"id": "usdd",            "symbol": "USDD", "name": "USDD"},
-    {"id": "first-digital-usd","symbol": "FDUSD","name": "First Digital USD"},
+    {"id": "tether",             "symbol": "USDT",  "name": "Tether"},
+    {"id": "usd-coin",           "symbol": "USDC",  "name": "USD Coin"},
+    {"id": "dai",                "symbol": "DAI",   "name": "Dai"},
+    {"id": "frax",               "symbol": "FRAX",  "name": "Frax"},
+    {"id": "true-usd",           "symbol": "TUSD",  "name": "TrueUSD"},
+    {"id": "paypal-usd",         "symbol": "PYUSD", "name": "PayPal USD"},
+    {"id": "liquity-usd",        "symbol": "LUSD",  "name": "Liquity USD"},
+    {"id": "usdd",               "symbol": "USDD",  "name": "USDD"},
+    {"id": "first-digital-usd",  "symbol": "FDUSD", "name": "First Digital USD"},
 ]
-
-# Remove the CRV placeholder — was just for slot count
-STABLECOINS = [s for s in STABLECOINS if s["symbol"] != "CRV"]
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -61,13 +57,13 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS depeg_events (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts          TEXT    NOT NULL,
-            symbol      TEXT    NOT NULL,
-            price       REAL    NOT NULL,
-            deviation   REAL    NOT NULL,
-            severity    TEXT    NOT NULL,
-            source      TEXT    NOT NULL
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts        TEXT    NOT NULL,
+            symbol    TEXT    NOT NULL,
+            price     REAL    NOT NULL,
+            deviation REAL    NOT NULL,
+            severity  TEXT    NOT NULL,
+            source    TEXT    NOT NULL
         )
     """)
     conn.commit()
@@ -84,168 +80,221 @@ def log_event(symbol, price, deviation, severity, source):
 
 # ── Price Fetching ────────────────────────────────────────────────────────────
 
-COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
-DEFILLAMA_URL = "https://coins.llama.fi/prices/current/"
-
-def fetch_coingecko(coin_ids: list[str]) -> dict:
-    """Returns {coin_id: price} or {} on failure."""
+def fetch_coingecko(ids):
     try:
-        resp = requests.get(
-            COINGECKO_URL,
-            params={"ids": ",".join(coin_ids), "vs_currencies": "usd"},
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": ",".join(ids), "vs_currencies": "usd"},
             timeout=10,
         )
-        resp.raise_for_status()
-        data = resp.json()
+        r.raise_for_status()
+        data = r.json()
         return {k: v["usd"] for k, v in data.items() if "usd" in v}
     except Exception as e:
-        log.warning(f"CoinGecko fetch failed: {e}")
+        log.warning(f"CoinGecko failed: {e}")
         return {}
 
-def fetch_defillama(coin_ids: list[str]) -> dict:
-    """
-    DeFiLlama coins API. Expects coingecko:coin-id format.
-    Returns {coingecko_id: price} or {} on failure.
-    """
+def fetch_defillama(ids):
     try:
-        keys = ",".join(f"coingecko:{cid}" for cid in coin_ids)
-        resp = requests.get(f"{DEFILLAMA_URL}{keys}", timeout=10)
-        resp.raise_for_status()
-        coins = resp.json().get("coins", {})
-        result = {}
-        for k, v in coins.items():
-            cid = k.replace("coingecko:", "")
-            result[cid] = v.get("price")
-        return {k: v for k, v in result.items() if v is not None}
+        keys = ",".join(f"coingecko:{i}" for i in ids)
+        r = requests.get(f"https://coins.llama.fi/prices/current/{keys}", timeout=10)
+        r.raise_for_status()
+        coins = r.json().get("coins", {})
+        return {k.replace("coingecko:", ""): v["price"]
+                for k, v in coins.items() if "price" in v}
     except Exception as e:
-        log.warning(f"DeFiLlama fetch failed: {e}")
+        log.warning(f"DeFiLlama failed: {e}")
         return {}
 
-def get_prices() -> tuple[dict, str]:
-    """
-    Returns (prices_dict, source_label).
-    Tries CoinGecko first; falls over to DeFiLlama if empty.
-    """
+def get_prices():
     ids = [s["id"] for s in STABLECOINS]
     prices = fetch_coingecko(ids)
     if prices:
         return prices, "CoinGecko"
-    log.info("CoinGecko returned empty — falling over to DeFiLlama")
-    prices = fetch_defillama(ids)
-    return prices, "DeFiLlama"
+    log.info("CoinGecko empty — falling over to DeFiLlama")
+    return fetch_defillama(ids), "DeFiLlama"
 
 # ── Alert Logic ───────────────────────────────────────────────────────────────
 
-def classify_severity(deviation: float) -> str | None:
-    """Returns severity string or None if within normal range."""
-    if deviation >= THRESHOLDS["critical"]:
-        return "critical"
-    if deviation >= THRESHOLDS["alert"]:
-        return "alert"
-    if deviation >= THRESHOLDS["warning"]:
-        return "warning"
+def classify_severity(deviation):
+    if deviation >= THRESHOLDS["critical"]: return "critical"
+    if deviation >= THRESHOLDS["alert"]:    return "alert"
+    if deviation >= THRESHOLDS["warning"]:  return "warning"
     return None
 
-SEVERITY_EMOJI = {
-    "warning":  "⚠️",
-    "alert":    "🚨",
-    "critical": "🔴",
-}
+SEVERITY_EMOJI = {"warning": "⚠️", "alert": "🚨", "critical": "🔴"}
 
-def format_alert(coin: dict, price: float, deviation: float, severity: str) -> str:
-    emoji = SEVERITY_EMOJI[severity]
+def format_alert(coin, price, deviation, severity):
+    emoji     = SEVERITY_EMOJI[severity]
     direction = "ABOVE" if price > 1.0 else "BELOW"
-    pct = deviation * 100
-    cg_link = f"https://www.coingecko.com/en/coins/{coin['id']}"
+    pct       = deviation * 100
+    cg_link   = f"https://www.coingecko.com/en/coins/{coin['id']}"
+    channel   = f" | Join: {TELEGRAM_CHANNEL}" if TELEGRAM_CHANNEL else ""
     return (
-        f"{emoji} *{coin['name']} ({coin['symbol']}) DEPEG {severity.upper()}*\n"
+        f"{emoji} *{coin['name']} ({coin['symbol']}) — DEPEG {severity.upper()}*\n"
         f"Price: `${price:.5f}` — {pct:.3f}% {direction} peg\n"
-        f"[View on CoinGecko]({cg_link})\n"
-        f"_Reported: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_"
+        f"[View on CoinGecko]({cg_link}){channel}\n"
+        f"_{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_"
     )
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 
-def send_telegram(message: str) -> bool:
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHANNEL:
-        log.warning("Telegram not configured — printing alert locally:")
-        log.warning(message)
-        return False
+def tg(method, **kwargs):
+    if not TELEGRAM_TOKEN:
+        return None
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        resp = requests.post(url, json={
-            "chat_id": TELEGRAM_CHANNEL,
-            "text": message,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": True,
-        }, timeout=10)
-        resp.raise_for_status()
-        return True
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}",
+            json=kwargs, timeout=10
+        )
+        r.raise_for_status()
+        return r.json()
     except Exception as e:
-        log.error(f"Telegram send failed: {e}")
-        return False
+        log.error(f"Telegram {method} failed: {e}")
+        return None
+
+def send_message(chat_id, text, parse_mode="Markdown"):
+    tg("sendMessage", chat_id=chat_id, text=text,
+       parse_mode=parse_mode, disable_web_page_preview=True)
+
+def broadcast(text):
+    """Send to the public alerts channel."""
+    if TELEGRAM_CHANNEL:
+        send_message(TELEGRAM_CHANNEL, text)
+    else:
+        log.warning(f"[NO CHANNEL] {text}")
 
 # ── Alert Dedup ───────────────────────────────────────────────────────────────
 
-# In-memory cooldown: don't re-alert same coin+severity within 10 minutes
-_last_alert: dict[str, float] = {}
-COOLDOWN_SECONDS = 600  # 10 minutes
+_last_alert: dict = {}
+COOLDOWN = 600  # 10 min per coin+severity
 
-def should_alert(symbol: str, severity: str) -> bool:
-    key = f"{symbol}:{severity}"
-    now = time.time()
-    last = _last_alert.get(key, 0)
-    if now - last >= COOLDOWN_SECONDS:
+def should_alert(symbol, severity):
+    key  = f"{symbol}:{severity}"
+    now  = time.time()
+    if now - _last_alert.get(key, 0) >= COOLDOWN:
         _last_alert[key] = now
         return True
     return False
 
+# ── Snapshot helper ───────────────────────────────────────────────────────────
+
+def snapshot_text(prices, source):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [f"📊 *Stablecoin Status* — {now} ({source})\n"]
+    for coin in STABLECOINS:
+        price = prices.get(coin["id"])
+        if price is None:
+            lines.append(f"  {coin['symbol']:6s} — no data")
+            continue
+        dev  = abs(price - 1.0)
+        sev  = classify_severity(dev)
+        icon = SEVERITY_EMOJI.get(sev, "✅") if sev else "✅"
+        lines.append(f"  {icon} {coin['symbol']:6s} `${price:.5f}`  ({dev*100:.3f}% off peg)")
+    return "\n".join(lines)
+
+# ── Bot Command Listener ──────────────────────────────────────────────────────
+
+_last_update_id = 0
+_latest_prices  = {}
+_latest_source  = "pending"
+
+def handle_commands():
+    global _last_update_id
+    while True:
+        try:
+            result = tg("getUpdates", offset=_last_update_id + 1, timeout=30)
+            if not result or not result.get("ok"):
+                time.sleep(5)
+                continue
+            for update in result.get("result", []):
+                _last_update_id = update["update_id"]
+                msg = update.get("message") or update.get("channel_post")
+                if not msg:
+                    continue
+                text    = msg.get("text", "")
+                chat_id = msg["chat"]["id"]
+                cmd     = text.split()[0].split("@")[0].lower() if text else ""
+
+                if cmd == "/start":
+                    channel_line = f"\n\n📢 Follow the alerts channel: {TELEGRAM_CHANNEL}" if TELEGRAM_CHANNEL else ""
+                    send_message(chat_id,
+                        f"👋 *Welcome to StableWatch!*\n\n"
+                        f"I monitor {len(STABLECOINS)} major stablecoins 24/7 and alert you the moment any drifts from its $1.00 peg.\n\n"
+                        f"*Alert thresholds:*\n"
+                        f"⚠️ WARNING — >0.10% off peg\n"
+                        f"🚨 ALERT — >0.50% off peg\n"
+                        f"🔴 CRITICAL — >1.00% off peg\n"
+                        f"{channel_line}\n\n"
+                        f"Use /status to see current prices. Free during beta."
+                    )
+
+                elif cmd == "/status":
+                    if _latest_prices:
+                        send_message(chat_id, snapshot_text(_latest_prices, _latest_source))
+                    else:
+                        send_message(chat_id, "⏳ Fetching first price data... try again in 30 seconds.")
+
+                elif cmd == "/help":
+                    send_message(chat_id,
+                        f"*StableWatch — How it works*\n\n"
+                        f"I poll {len(STABLECOINS)} stablecoins every {POLL_INTERVAL}s via CoinGecko + DeFiLlama failover.\n\n"
+                        f"*Commands:*\n"
+                        f"/status — Live peg status for all coins\n"
+                        f"/help — This message\n\n"
+                        f"*Monitored:* " + ", ".join(s["symbol"] for s in STABLECOINS) + "\n\n"
+                        f"Free beta. No spam. Alerts fire max once per 10 min per coin."
+                    )
+        except Exception as e:
+            log.error(f"Command handler error: {e}")
+            time.sleep(5)
+
 # ── Main Loop ─────────────────────────────────────────────────────────────────
 
 def run():
-    log.info("=== Stablecoin Depeg Monitor v0.1 starting ===")
-    log.info(f"Monitoring {len(STABLECOINS)} stablecoins | Poll interval: {POLL_INTERVAL}s")
-    log.info(f"Thresholds — Warning: {THRESHOLDS['warning']*100:.2f}% | Alert: {THRESHOLDS['alert']*100:.2f}% | Critical: {THRESHOLDS['critical']*100:.2f}%")
+    global _latest_prices, _latest_source
+
+    log.info("=== StableWatch Depeg Monitor v0.1 ===")
+    log.info(f"Monitoring {len(STABLECOINS)} stablecoins | Poll: {POLL_INTERVAL}s | Channel: {TELEGRAM_CHANNEL or 'NOT SET'}")
 
     init_db()
 
-    if not TELEGRAM_TOKEN:
-        log.warning("TELEGRAM_TOKEN not set — alerts will print to console only")
+    if TELEGRAM_TOKEN:
+        cmd_thread = threading.Thread(target=handle_commands, daemon=True)
+        cmd_thread.start()
+        log.info("Command listener started")
+    else:
+        log.warning("TELEGRAM_TOKEN not set — console-only mode")
 
     cycle = 0
     while True:
         cycle += 1
         prices, source = get_prices()
+        _latest_prices = prices
+        _latest_source = source
 
         if not prices:
-            log.warning(f"[Cycle {cycle}] Both price sources failed. Sleeping {POLL_INTERVAL}s.")
+            log.warning(f"[Cycle {cycle}] Both price sources failed.")
             time.sleep(POLL_INTERVAL)
             continue
 
-        alerts_fired = 0
+        fired = 0
         for coin in STABLECOINS:
             price = prices.get(coin["id"])
             if price is None:
-                log.debug(f"  {coin['symbol']}: no price data from {source}")
                 continue
-
-            deviation = abs(price - 1.0)
-            severity = classify_severity(deviation)
-
+            dev      = abs(price - 1.0)
+            severity = classify_severity(dev)
             if severity:
-                log.warning(
-                    f"  {coin['symbol']}: ${price:.5f} | {deviation*100:.3f}% off peg | {severity.upper()} [{source}]"
-                )
-                log_event(coin["symbol"], price, deviation, severity, source)
+                log.warning(f"  {coin['symbol']}: ${price:.5f} | {dev*100:.3f}% | {severity.upper()} [{source}]")
+                log_event(coin["symbol"], price, dev, severity, source)
                 if should_alert(coin["symbol"], severity):
-                    msg = format_alert(coin, price, deviation, severity)
-                    sent = send_telegram(msg)
-                    alerts_fired += 1
-                    log.info(f"  Alert sent via Telegram: {sent}")
+                    broadcast(format_alert(coin, price, dev, severity))
+                    fired += 1
             else:
-                log.debug(f"  {coin['symbol']}: ${price:.5f} — OK")
+                log.debug(f"  {coin['symbol']}: ${price:.5f} OK")
 
-        log.info(f"[Cycle {cycle}] Checked {len(prices)} coins via {source}. Alerts fired: {alerts_fired}.")
+        log.info(f"[Cycle {cycle}] {len(prices)} coins via {source}. Alerts: {fired}.")
         time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
