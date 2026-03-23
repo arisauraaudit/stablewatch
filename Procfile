@@ -1,1 +1,1 @@
-worker: python monitor.py
+web: python monitor.py
